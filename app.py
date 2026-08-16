@@ -15,6 +15,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
 API_KEY = os.environ.get("PSEUDOGRAM_API_KEY", "").strip()
 print("API KEY LOADED:", bool(API_KEY))
 print("API KEY LENGTH:", len(API_KEY))
+print("API KEY SHA256:", hashlib.sha256(API_KEY.encode("utf-8")).hexdigest())
 BASE_URL = os.environ.get("PSEUDOGRAM_BASE_URL", "https://pseudogram-api.onrender.com")
 
 app = Flask(__name__)
