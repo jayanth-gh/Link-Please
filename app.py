@@ -12,7 +12,9 @@ import requests
 from flask import Flask, request, jsonify
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
-API_KEY = os.environ.get("PSEUDOGRAM_API_KEY")
+API_KEY = os.environ.get("PSEUDOGRAM_API_KEY", "").strip()
+print("API KEY LOADED:", bool(API_KEY))
+print("API KEY LENGTH:", len(API_KEY))
 BASE_URL = os.environ.get("PSEUDOGRAM_BASE_URL", "https://pseudogram-api.onrender.com")
 
 app = Flask(__name__)
@@ -116,7 +118,7 @@ def create_rule():
     return jsonify({"rule_id": rule_id, "keyword": keyword, "dm_message": dm_message}), 201
 
 def verify_webhook_signature(raw_body, signature):
-    if not API_KEY or not signature:
+    if not signature:
         return False
 
     if not signature.startswith("sha256="):
@@ -130,7 +132,7 @@ def verify_webhook_signature(raw_body, signature):
         hashlib.sha256
     ).hexdigest()
 
-    return hmac.compare_digest(received, expected)
+    return hmac.compare_digest(expected, received)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
