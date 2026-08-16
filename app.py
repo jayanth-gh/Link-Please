@@ -143,9 +143,26 @@ def webhook():
     # Verify PseudoGram webhook signature before processing anything.
     signature = request.headers.get("X-PseudoGram-Signature")
 
-    if not verify_webhook_signature(raw, signature):
-        return jsonify({"error": "invalid signature"}), 401
+    expected = hmac.new(
+    API_KEY.encode("utf-8"),
+    raw,
+    hashlib.sha256
+    ).hexdigest()
 
+    print("RECEIVED SIGNATURE:", signature[:30] if signature else None)
+    print("EXPECTED SIGNATURE:", ("sha256=" + expected)[:30])
+    print("BODY LENGTH:", len(raw))
+
+    if not signature:
+      return jsonify({"error": "missing signature"}), 401
+
+    received = signature.strip()
+
+    if not hmac.compare_digest(received, "sha256=" + expected):
+       print("SIGNATURE MISMATCH")
+       return jsonify({"error": "invalid signature"}), 401
+
+    print("SIGNATURE VALID")
     # Parse JSON only after signature verification succeeds.
     try:
         data = json.loads(raw)
