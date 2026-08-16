@@ -143,47 +143,64 @@ def webhook():
     api_key = os.environ.get("PSEUDOGRAM_API_KEY", "")
 
     print("\n========== WEBHOOK DEBUG ==========")
-    print("BODY:", raw.decode("utf-8", errors="replace"))
     print("BODY LENGTH:", len(raw))
-    print("RAW BODY HEX:", raw.hex())
     print("RECEIVED SIGNATURE:", signature)
     print("API KEY LENGTH:", len(api_key))
-    print("API KEY SHA256:", hashlib.sha256(api_key.encode("utf-8")).hexdigest())
 
-    # 1. Correct specification: HMAC over exact raw bytes
-    expected_raw = hmac.new(
+    # ---------------------------------------------------------
+    # Candidate 1:
+    # Use the API key string directly as the HMAC secret
+    # ---------------------------------------------------------
+    expected_string = hmac.new(
         api_key.encode("utf-8"),
         raw,
         hashlib.sha256
     ).hexdigest()
 
-    print("EXPECTED RAW:", "sha256=" + expected_raw)
+    print(
+        "EXPECTED STRING:",
+        "sha256=" + expected_string
+    )
 
-    # 2. Test decoded/re-encoded JSON ONLY for diagnosis
+    # ---------------------------------------------------------
+    # Candidate 2:
+    # Treat the API key as Base64 and decode it first
+    # ---------------------------------------------------------
+    expected_base64 = None
+
     try:
-        data_for_debug = json.loads(raw)
+        import base64
 
-        normalized = json.dumps(
-            data_for_debug,
-            separators=(",", ":"),
-            ensure_ascii=False
-        ).encode("utf-8")
+        decoded_key = base64.b64decode(
+            api_key,
+            validate=True
+        )
 
-        expected_normalized = hmac.new(
-            api_key.encode("utf-8"),
-            normalized,
+        expected_base64 = hmac.new(
+            decoded_key,
+            raw,
             hashlib.sha256
         ).hexdigest()
 
-        print("NORMALIZED LENGTH:", len(normalized))
-        print("NORMALIZED:", normalized.decode("utf-8"))
-        print("EXPECTED NORMALIZED:", "sha256=" + expected_normalized)
+        print(
+            "DECODED KEY LENGTH:",
+            len(decoded_key)
+        )
+
+        print(
+            "EXPECTED BASE64-DECODED:",
+            "sha256=" + expected_base64
+        )
 
     except Exception as e:
-        data_for_debug = None
-        print("JSON DEBUG ERROR:", e)
+        print(
+            "BASE64 DECODE FAILED:",
+            str(e)
+        )
 
-    # 3. Actual required verification
+    # ---------------------------------------------------------
+    # Check received signature
+    # ---------------------------------------------------------
     if not signature:
         print("MISSING SIGNATURE")
         print("===================================\n")
@@ -191,25 +208,47 @@ def webhook():
 
     received = signature.strip()
 
-    if not hmac.compare_digest(
+    # ---------------------------------------------------------
+    # Candidate 1 matches
+    # ---------------------------------------------------------
+    if hmac.compare_digest(
         received,
-        "sha256=" + expected_raw
+        "sha256=" + expected_string
     ):
+        print("SIGNATURE VALID - STRING KEY")
+        print("===================================\n")
+
+    # ---------------------------------------------------------
+    # Candidate 2 matches
+    # ---------------------------------------------------------
+    elif (
+        expected_base64 is not None
+        and hmac.compare_digest(
+            received,
+            "sha256=" + expected_base64
+        )
+    ):
+        print("SIGNATURE VALID - BASE64 DECODED KEY")
+        print("===================================\n")
+
+    # ---------------------------------------------------------
+    # Neither matches
+    # ---------------------------------------------------------
+    else:
         print("SIGNATURE MISMATCH")
         print("===================================\n")
-        return jsonify({"error": "invalid signature"}), 401
 
-    print("SIGNATURE VALID")
-    print("===================================\n")
+        return jsonify({
+            "error": "invalid signature"
+        }), 401
 
-    # If JSON wasn't decoded above, decode it now.
-    if data_for_debug is None:
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return ("", 400)
-    else:
-        data = data_for_debug
+    # ---------------------------------------------------------
+    # Parse JSON AFTER signature verification
+    # ---------------------------------------------------------
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ("", 400)
 
     event_id = data.get("event_id")
     event_type = data.get("event_type")
@@ -218,7 +257,9 @@ def webhook():
     db = get_db()
     cur = db.cursor()
 
+    # ---------------------------------------------------------
     # Persist event idempotently
+    # ---------------------------------------------------------
     try:
         cur.execute(
             """
@@ -237,29 +278,42 @@ def webhook():
                 created_at
             )
         )
+
         db.commit()
 
     except sqlite3.IntegrityError:
         db.close()
         return ("", 200)
 
+    # ---------------------------------------------------------
+    # Extract comment
+    # ---------------------------------------------------------
     comment = data.get("data") or {}
 
     text = comment.get("text", "")
+
     user = comment.get("from") or {}
 
     user_id = user.get("user_id")
     username = user.get("username")
     comment_id = comment.get("comment_id")
 
-    cur.execute("SELECT rule_id, keyword FROM rules")
+    # ---------------------------------------------------------
+    # Match rules
+    # ---------------------------------------------------------
+    cur.execute(
+        "SELECT rule_id, keyword FROM rules"
+    )
+
     rules = cur.fetchall()
 
     for r in rules:
+
         rule_id = r[0]
         keyword = r[1]
 
         if keyword.lower() in text.lower():
+
             ts = now_ts()
 
             try:
@@ -294,6 +348,7 @@ def webhook():
                 db.commit()
 
             except sqlite3.IntegrityError:
+
                 cur.execute(
                     """
                     INSERT INTO metrics(key, value)
