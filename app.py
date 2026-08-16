@@ -137,51 +137,148 @@ def verify_webhook_signature(raw_body, signature):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Get the exact raw request body.
+    # =========================================================
+    # 1. Get exact raw request body
+    # =========================================================
     raw = request.get_data()
 
-    # Get PseudoGram's signature.
-    signature = request.headers.get("X-PseudoGram-Signature", "")
+    # =========================================================
+    # 2. Get signature
+    # =========================================================
+    signature = request.headers.get(
+        "X-PseudoGram-Signature",
+        ""
+    )
 
-    # API key from Render environment variable.
-    api_key = os.environ.get("PSEUDOGRAM_API_KEY", "").strip()
+    api_key = os.environ.get(
+        "PSEUDOGRAM_API_KEY",
+        ""
+    ).strip()
 
-    # Calculate HMAC-SHA256 over the exact raw body.
-    expected = hmac.new(
-        api_key.encode("utf-8"),
-        raw,
-        hashlib.sha256
-    ).hexdigest()
-
-    # Reject missing signature.
-    if not signature:
-        return jsonify({"error": "missing signature"}), 401
-
-    # Compare received signature with expected signature.
     received = signature.strip()
+
+    print("\n========== SIGNATURE DEBUG ==========")
+    print("BODY LENGTH:", len(raw))
+    print("RECEIVED:", received)
+
+    # =========================================================
+    # Helper for HMAC
+    # =========================================================
+    def hmac_hex(message):
+        return hmac.new(
+            api_key.encode("utf-8"),
+            message,
+            hashlib.sha256
+        ).hexdigest()
+
+    # =========================================================
+    # 3. HMAC using EXACT raw body
+    # =========================================================
+    expected_raw = hmac_hex(raw)
+
+    print(
+        "RAW:",
+        "sha256=" + expected_raw
+    )
+
+    # =========================================================
+    # 4. Test other JSON representations
+    #    ONLY FOR DIAGNOSTICS
+    # =========================================================
+    data = None
+
+    try:
+        data = json.loads(raw)
+
+        # Compact JSON
+        compact = json.dumps(
+            data,
+            separators=(",", ":"),
+            ensure_ascii=False
+        ).encode("utf-8")
+
+        expected_compact = hmac_hex(compact)
+
+        print(
+            "COMPACT:",
+            "sha256=" + expected_compact
+        )
+
+        # Sorted compact JSON
+        sorted_compact = json.dumps(
+            data,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False
+        ).encode("utf-8")
+
+        expected_sorted = hmac_hex(sorted_compact)
+
+        print(
+            "SORTED:",
+            "sha256=" + expected_sorted
+        )
+
+        # Default Python JSON
+        default_json = json.dumps(
+            data,
+            ensure_ascii=False
+        ).encode("utf-8")
+
+        expected_default = hmac_hex(default_json)
+
+        print(
+            "DEFAULT:",
+            "sha256=" + expected_default
+        )
+
+    except Exception as e:
+        print("JSON DEBUG ERROR:", str(e))
+
+    print("=====================================")
+
+    # =========================================================
+    # 5. Required signature verification
+    # =========================================================
+    if not received:
+        print("MISSING SIGNATURE")
+        return jsonify({
+            "error": "missing signature"
+        }), 401
 
     if not hmac.compare_digest(
         received,
-        "sha256=" + expected
+        "sha256=" + expected_raw
     ):
-        return jsonify({"error": "invalid signature"}), 401
+        print("SIGNATURE MISMATCH")
+        return jsonify({
+            "error": "invalid signature"
+        }), 401
 
-    # Parse JSON only after signature verification.
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return ("", 400)
+    print("SIGNATURE VALID")
+
+    # =========================================================
+    # 6. Parse JSON
+    # =========================================================
+    if data is None:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return ("", 400)
 
     event_id = data.get("event_id")
     event_type = data.get("event_type")
     created_at = now_ts()
 
+    # =========================================================
+    # 7. Database
+    # =========================================================
     db = get_db()
     cur = db.cursor()
 
-    # ---------------------------------------------------------
-    # Persist event idempotently
-    # ---------------------------------------------------------
+    # =========================================================
+    # 8. Idempotent event persistence
+    # =========================================================
     try:
         cur.execute(
             """
@@ -196,7 +293,9 @@ def webhook():
             (
                 event_id,
                 event_type,
-                json.dumps(data.get("data") or {}),
+                json.dumps(
+                    data.get("data") or {}
+                ),
                 created_at
             )
         )
@@ -204,37 +303,54 @@ def webhook():
         db.commit()
 
     except sqlite3.IntegrityError:
-        # Same event_id already processed.
+        # Event already processed
         db.close()
         return ("", 200)
 
-    # ---------------------------------------------------------
-    # Extract comment information
-    # ---------------------------------------------------------
+    # =========================================================
+    # 9. Extract comment
+    # =========================================================
     comment = data.get("data") or {}
 
-    text = comment.get("text", "")
+    text = comment.get(
+        "text",
+        ""
+    )
 
-    user = comment.get("from") or {}
+    user = comment.get(
+        "from"
+    ) or {}
 
-    user_id = user.get("user_id")
-    username = user.get("username")
-    comment_id = comment.get("comment_id")
+    user_id = user.get(
+        "user_id"
+    )
 
-    # ---------------------------------------------------------
-    # Find matching rules
-    # ---------------------------------------------------------
+    username = user.get(
+        "username"
+    )
+
+    comment_id = comment.get(
+        "comment_id"
+    )
+
+    # =========================================================
+    # 10. Get all rules
+    # =========================================================
     cur.execute(
         "SELECT rule_id, keyword FROM rules"
     )
 
     rules = cur.fetchall()
 
+    # =========================================================
+    # 11. Match keywords and enqueue deliveries
+    # =========================================================
     for r in rules:
+
         rule_id = r[0]
         keyword = r[1]
 
-        # Case-insensitive substring matching.
+        # Case-insensitive substring match
         if keyword.lower() in text.lower():
 
             ts = now_ts()
@@ -271,10 +387,14 @@ def webhook():
                 db.commit()
 
             except sqlite3.IntegrityError:
-                # Duplicate delivery for the same rule + user.
+
+                # Duplicate rule + user
                 cur.execute(
                     """
-                    INSERT INTO metrics(key, value)
+                    INSERT INTO metrics(
+                        key,
+                        value
+                    )
                     VALUES(?, ?)
                     ON CONFLICT(key)
                     DO UPDATE SET value = value + ?
@@ -288,9 +408,16 @@ def webhook():
 
                 db.commit()
 
+                continue
+
+    # =========================================================
+    # 12. Close database
+    # =========================================================
     db.close()
 
-    # Must respond quickly with HTTP 200.
+    # =========================================================
+    # 13. Return immediately
+    # =========================================================
     return ("", 200)
 
 def send_dm(delivery, rule_message):
