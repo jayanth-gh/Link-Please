@@ -137,33 +137,45 @@ def verify_webhook_signature(raw_body, signature):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Get the raw request body exactly as received.
-    # The signature is calculated from these exact bytes.
+    # Get the exact raw request body received from Pseudogram.
     raw = request.get_data()
 
-    # Verify PseudoGram webhook signature before processing anything.
+    # Get the signature sent by Pseudogram.
     signature = request.headers.get("X-PseudoGram-Signature")
 
+    # Calculate our expected HMAC-SHA256 signature.
     expected = hmac.new(
-    API_KEY.encode("utf-8"),
-    raw,
-    hashlib.sha256
+        API_KEY.encode("utf-8"),
+        raw,
+        hashlib.sha256
     ).hexdigest()
 
-    print("RECEIVED SIGNATURE:", signature[:30] if signature else None)
-    print("EXPECTED SIGNATURE:", ("sha256=" + expected)[:30])
+    # Temporary debugging.
+    # IMPORTANT: Do not print API_KEY itself.
+    print("========== WEBHOOK DEBUG ==========")
+    print("BODY:", raw.decode("utf-8", errors="replace"))
     print("BODY LENGTH:", len(raw))
+    print("RECEIVED SIGNATURE:", signature)
+    print("EXPECTED SIGNATURE:", "sha256=" + expected)
+    print("===================================")
 
+    # Signature must exist.
     if not signature:
-      return jsonify({"error": "missing signature"}), 401
+        print("SIGNATURE MISSING")
+        return jsonify({"error": "missing signature"}), 401
 
     received = signature.strip()
 
-    if not hmac.compare_digest(received, "sha256=" + expected):
-       print("SIGNATURE MISMATCH")
-       return jsonify({"error": "invalid signature"}), 401
+    # Verify signature.
+    if not hmac.compare_digest(
+        received,
+        "sha256=" + expected
+    ):
+        print("SIGNATURE MISMATCH")
+        return jsonify({"error": "invalid signature"}), 401
 
     print("SIGNATURE VALID")
+
     # Parse JSON only after signature verification succeeds.
     try:
         data = json.loads(raw)
@@ -177,7 +189,7 @@ def webhook():
     db = get_db()
     cur = db.cursor()
 
-    # Persist event (idempotent)
+    # Persist event idempotently.
     try:
         cur.execute(
             """
@@ -200,11 +212,9 @@ def webhook():
 
     except sqlite3.IntegrityError:
         # Event was already processed.
-        # Return 200 quickly without creating another delivery.
         db.close()
         return ("", 200)
 
-    # Quick background enqueue:
     # Find matching rules and create delivery rows.
     comment = data.get("data") or {}
 
@@ -261,7 +271,6 @@ def webhook():
 
             except sqlite3.IntegrityError:
                 # Same user + same rule already has a delivery.
-                # Count it as a duplicate without opening another DB connection.
                 cur.execute(
                     """
                     INSERT INTO metrics(key, value)
@@ -282,7 +291,6 @@ def webhook():
     db.close()
 
     return ("", 200)
-
 
 def send_dm(delivery, rule_message):
     url = f"{BASE_URL}/v1/dm/send"
