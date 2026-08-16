@@ -137,59 +137,107 @@ def verify_webhook_signature(raw_body, signature):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Get the exact raw request body received from Pseudogram.
+    # ---------------------------------------------------------
+    # 1. Get the EXACT raw request body
+    # ---------------------------------------------------------
     raw = request.get_data()
 
-    # Get the signature sent by Pseudogram.
+    # ---------------------------------------------------------
+    # 2. Get the signature sent by PseudoGram
+    # ---------------------------------------------------------
     signature = request.headers.get("X-PseudoGram-Signature")
 
-    # Calculate our expected HMAC-SHA256 signature.
+    print("\n========== WEBHOOK DEBUG ==========")
+    print("BODY:", raw.decode("utf-8", errors="replace"))
+    print("BODY LENGTH:", len(raw))
+    print("RECEIVED SIGNATURE:", signature)
+
+    # ---------------------------------------------------------
+    # 3. Check signature exists
+    # ---------------------------------------------------------
+    if not signature:
+        print("MISSING SIGNATURE")
+        print("===================================\n")
+        return jsonify({"error": "missing signature"}), 401
+
+    # ---------------------------------------------------------
+    # 4. Calculate HMAC using the API key currently loaded
+    # ---------------------------------------------------------
     expected = hmac.new(
         API_KEY.encode("utf-8"),
         raw,
         hashlib.sha256
     ).hexdigest()
 
-    # Temporary debugging.
-    # IMPORTANT: Do not print API_KEY itself.
-    print("========== WEBHOOK DEBUG ==========")
-    print("BODY:", raw.decode("utf-8", errors="replace"))
-    print("BODY LENGTH:", len(raw))
-    print("RECEIVED SIGNATURE:", signature)
-    print("EXPECTED SIGNATURE:", "sha256=" + expected)
-    print("===================================")
+    # ---------------------------------------------------------
+    # 5. Additional debugging
+    #    DO NOT print the actual API key
+    # ---------------------------------------------------------
+    raw_env_key = os.environ.get("PSEUDOGRAM_API_KEY", "")
 
-    # Signature must exist.
-    if not signature:
-        print("SIGNATURE MISSING")
-        return jsonify({"error": "missing signature"}), 401
+    expected_raw_env = hmac.new(
+        raw_env_key.encode("utf-8"),
+        raw,
+        hashlib.sha256
+    ).hexdigest()
 
+    print("API KEY LOADED:", bool(API_KEY))
+    print("API KEY LENGTH:", len(API_KEY))
+    print("RAW ENV KEY LENGTH:", len(raw_env_key))
+
+    print(
+        "API KEY SHA256:",
+        hashlib.sha256(API_KEY.encode("utf-8")).hexdigest()
+    )
+
+    print(
+        "RAW ENV SHA256:",
+        hashlib.sha256(raw_env_key.encode("utf-8")).hexdigest()
+    )
+
+    print("EXPECTED USING API_KEY:", "sha256=" + expected)
+    print("EXPECTED USING RAW ENV:", "sha256=" + expected_raw_env)
+
+    # ---------------------------------------------------------
+    # 6. Normalize received signature
+    # ---------------------------------------------------------
     received = signature.strip()
 
-    # Verify signature.
-    if not hmac.compare_digest(
-        received,
-        "sha256=" + expected
-    ):
+    # ---------------------------------------------------------
+    # 7. Verify signature
+    # ---------------------------------------------------------
+    expected_signature = "sha256=" + expected
+
+    print("NORMALIZED RECEIVED:", received)
+    print("EXPECTED SIGNATURE:", expected_signature)
+
+    if not hmac.compare_digest(received, expected_signature):
         print("SIGNATURE MISMATCH")
+        print("===================================\n")
         return jsonify({"error": "invalid signature"}), 401
 
     print("SIGNATURE VALID")
 
-    # Parse JSON only after signature verification succeeds.
+    # ---------------------------------------------------------
+    # 8. Parse JSON ONLY after signature verification
+    # ---------------------------------------------------------
     try:
         data = json.loads(raw)
-    except Exception:
+    except Exception as e:
+        print("JSON PARSE ERROR:", str(e))
+        print("===================================\n")
         return ("", 400)
 
     event_id = data.get("event_id")
     event_type = data.get("event_type")
     created_at = now_ts()
 
+    # ---------------------------------------------------------
+    # 9. Store event idempotently
+    # ---------------------------------------------------------
     db = get_db()
     cur = db.cursor()
 
-    # Persist event idempotently.
     try:
         cur.execute(
             """
@@ -208,14 +256,21 @@ def webhook():
                 created_at
             )
         )
+
         db.commit()
 
     except sqlite3.IntegrityError:
-        # Event was already processed.
+        # Same event_id was already processed
+        print("DUPLICATE EVENT:", event_id)
+
         db.close()
+
+        print("===================================\n")
         return ("", 200)
 
-    # Find matching rules and create delivery rows.
+    # ---------------------------------------------------------
+    # 10. Extract comment information
+    # ---------------------------------------------------------
     comment = data.get("data") or {}
 
     text = comment.get("text", "")
@@ -227,15 +282,34 @@ def webhook():
 
     comment_id = comment.get("comment_id")
 
-    cur.execute("SELECT rule_id, keyword FROM rules")
+    print("EVENT ID:", event_id)
+    print("EVENT TYPE:", event_type)
+    print("COMMENT TEXT:", text)
+    print("USER ID:", user_id)
+    print("USERNAME:", username)
+    print("COMMENT ID:", comment_id)
+
+    # ---------------------------------------------------------
+    # 11. Find matching rules
+    # ---------------------------------------------------------
+    cur.execute(
+        "SELECT rule_id, keyword FROM rules"
+    )
+
     rules = cur.fetchall()
 
+    matched = False
+
     for r in rules:
+
         rule_id = r[0]
         keyword = r[1]
 
-        # Case-insensitive keyword matching.
+        # Case-insensitive keyword matching
         if keyword.lower() in text.lower():
+
+            matched = True
+
             ts = now_ts()
 
             try:
@@ -269,8 +343,16 @@ def webhook():
 
                 db.commit()
 
+                print(
+                    "DELIVERY QUEUED:",
+                    rule_id,
+                    user_id,
+                    keyword
+                )
+
             except sqlite3.IntegrityError:
-                # Same user + same rule already has a delivery.
+
+                # Same rule + same user already exists
                 cur.execute(
                     """
                     INSERT INTO metrics(key, value)
@@ -286,10 +368,29 @@ def webhook():
                 )
 
                 db.commit()
+
+                print(
+                    "DUPLICATE DELIVERY BLOCKED:",
+                    rule_id,
+                    user_id
+                )
+
                 continue
 
+    if not matched:
+        print("NO RULE MATCHED")
+
+    # ---------------------------------------------------------
+    # 12. Close DB
+    # ---------------------------------------------------------
     db.close()
 
+    print("WEBHOOK PROCESSING COMPLETE")
+    print("===================================\n")
+
+    # ---------------------------------------------------------
+    # 13. Return 200 quickly
+    # ---------------------------------------------------------
     return ("", 200)
 
 def send_dm(delivery, rule_message):
