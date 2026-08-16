@@ -5,6 +5,8 @@ import time
 import uuid
 import json
 from datetime import datetime
+import hmac
+import hashlib
 
 import requests
 from flask import Flask, request, jsonify
@@ -113,10 +115,36 @@ def create_rule():
     db.close()
     return jsonify({"rule_id": rule_id, "keyword": keyword, "dm_message": dm_message}), 201
 
+def verify_webhook_signature(raw_body, signature):
+    if not API_KEY or not signature:
+        return False
+
+    if not signature.startswith("sha256="):
+        return False
+
+    received = signature[len("sha256="):]
+
+    expected = hmac.new(
+        API_KEY.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(received, expected)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Get the raw request body exactly as received.
+    # The signature is calculated from these exact bytes.
     raw = request.get_data()
+
+    # Verify PseudoGram webhook signature before processing anything.
+    signature = request.headers.get("X-PseudoGram-Signature")
+
+    if not verify_webhook_signature(raw, signature):
+        return jsonify({"error": "invalid signature"}), 401
+
+    # Parse JSON only after signature verification succeeds.
     try:
         data = json.loads(raw)
     except Exception:
@@ -128,48 +156,111 @@ def webhook():
 
     db = get_db()
     cur = db.cursor()
-    # persist event (idempotent)
+
+    # Persist event (idempotent)
     try:
-        cur.execute("INSERT INTO events(event_id, event_type, payload, created_at) VALUES(?,?,?,?)",
-                    (event_id, event_type, json.dumps(data.get("data") or {}), created_at))
+        cur.execute(
+            """
+            INSERT INTO events(
+                event_id,
+                event_type,
+                payload,
+                created_at
+            )
+            VALUES(?,?,?,?)
+            """,
+            (
+                event_id,
+                event_type,
+                json.dumps(data.get("data") or {}),
+                created_at
+            )
+        )
         db.commit()
+
     except sqlite3.IntegrityError:
-        # already processed this event id; still return 200 quickly
+        # Event was already processed.
+        # Return 200 quickly without creating another delivery.
         db.close()
         return ("", 200)
 
-    # quick background enqueue: find matching rules and create delivery rows
+    # Quick background enqueue:
+    # Find matching rules and create delivery rows.
     comment = data.get("data") or {}
+
     text = comment.get("text", "")
+
     user = comment.get("from") or {}
+
     user_id = user.get("user_id")
     username = user.get("username")
+
     comment_id = comment.get("comment_id")
 
     cur.execute("SELECT rule_id, keyword FROM rules")
     rules = cur.fetchall()
+
     for r in rules:
         rule_id = r[0]
         keyword = r[1]
+
+        # Case-insensitive keyword matching.
         if keyword.lower() in text.lower():
             ts = now_ts()
+
             try:
                 cur.execute(
-                    "INSERT INTO deliveries(rule_id, user_id, username, comment_id, status, attempts, next_attempt_at, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (rule_id, user_id, username, comment_id, "queued", 0, ts, ts, ts),
+                    """
+                    INSERT INTO deliveries(
+                        rule_id,
+                        user_id,
+                        username,
+                        comment_id,
+                        status,
+                        attempts,
+                        next_attempt_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        rule_id,
+                        user_id,
+                        username,
+                        comment_id,
+                        "queued",
+                        0,
+                        ts,
+                        ts,
+                        ts
+                    )
                 )
+
                 db.commit()
+
             except sqlite3.IntegrityError:
+                # Same user + same rule already has a delivery.
+                # Count it as a duplicate without opening another DB connection.
                 cur.execute(
-                  "INSERT INTO metrics(key, value) VALUES(?, ?) "
-                 "ON CONFLICT(key) DO UPDATE SET value = value + ?",
-                  ("duplicates_blocked", 1, 1)
+                    """
+                    INSERT INTO metrics(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key)
+                    DO UPDATE SET value = value + ?
+                    """,
+                    (
+                        "duplicates_blocked",
+                        1,
+                        1
+                    )
                 )
+
                 db.commit()
-                # duplicate for same rule+user; count blocked                # continue
                 continue
 
     db.close()
+
     return ("", 200)
 
 
