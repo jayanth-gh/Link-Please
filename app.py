@@ -137,114 +137,36 @@ def verify_webhook_signature(raw_body, signature):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Get the exact raw request body.
     raw = request.get_data()
+
+    # Get PseudoGram's signature.
     signature = request.headers.get("X-PseudoGram-Signature", "")
 
-    api_key = os.environ.get("PSEUDOGRAM_API_KEY", "")
+    # API key from Render environment variable.
+    api_key = os.environ.get("PSEUDOGRAM_API_KEY", "").strip()
 
-    print("\n========== WEBHOOK DEBUG ==========")
-    print("BODY LENGTH:", len(raw))
-    print("RECEIVED SIGNATURE:", signature)
-    print("API KEY LENGTH:", len(api_key))
-
-    # ---------------------------------------------------------
-    # Candidate 1:
-    # Use the API key string directly as the HMAC secret
-    # ---------------------------------------------------------
-    expected_string = hmac.new(
+    # Calculate HMAC-SHA256 over the exact raw body.
+    expected = hmac.new(
         api_key.encode("utf-8"),
         raw,
         hashlib.sha256
     ).hexdigest()
 
-    print(
-        "EXPECTED STRING:",
-        "sha256=" + expected_string
-    )
-
-    # ---------------------------------------------------------
-    # Candidate 2:
-    # Treat the API key as Base64 and decode it first
-    # ---------------------------------------------------------
-    expected_base64 = None
-
-    try:
-        import base64
-
-        decoded_key = base64.b64decode(
-            api_key,
-            validate=True
-        )
-
-        expected_base64 = hmac.new(
-            decoded_key,
-            raw,
-            hashlib.sha256
-        ).hexdigest()
-
-        print(
-            "DECODED KEY LENGTH:",
-            len(decoded_key)
-        )
-
-        print(
-            "EXPECTED BASE64-DECODED:",
-            "sha256=" + expected_base64
-        )
-
-    except Exception as e:
-        print(
-            "BASE64 DECODE FAILED:",
-            str(e)
-        )
-
-    # ---------------------------------------------------------
-    # Check received signature
-    # ---------------------------------------------------------
+    # Reject missing signature.
     if not signature:
-        print("MISSING SIGNATURE")
-        print("===================================\n")
         return jsonify({"error": "missing signature"}), 401
 
+    # Compare received signature with expected signature.
     received = signature.strip()
 
-    # ---------------------------------------------------------
-    # Candidate 1 matches
-    # ---------------------------------------------------------
-    if hmac.compare_digest(
+    if not hmac.compare_digest(
         received,
-        "sha256=" + expected_string
+        "sha256=" + expected
     ):
-        print("SIGNATURE VALID - STRING KEY")
-        print("===================================\n")
+        return jsonify({"error": "invalid signature"}), 401
 
-    # ---------------------------------------------------------
-    # Candidate 2 matches
-    # ---------------------------------------------------------
-    elif (
-        expected_base64 is not None
-        and hmac.compare_digest(
-            received,
-            "sha256=" + expected_base64
-        )
-    ):
-        print("SIGNATURE VALID - BASE64 DECODED KEY")
-        print("===================================\n")
-
-    # ---------------------------------------------------------
-    # Neither matches
-    # ---------------------------------------------------------
-    else:
-        print("SIGNATURE MISMATCH")
-        print("===================================\n")
-
-        return jsonify({
-            "error": "invalid signature"
-        }), 401
-
-    # ---------------------------------------------------------
-    # Parse JSON AFTER signature verification
-    # ---------------------------------------------------------
+    # Parse JSON only after signature verification.
     try:
         data = json.loads(raw)
     except Exception:
@@ -282,11 +204,12 @@ def webhook():
         db.commit()
 
     except sqlite3.IntegrityError:
+        # Same event_id already processed.
         db.close()
         return ("", 200)
 
     # ---------------------------------------------------------
-    # Extract comment
+    # Extract comment information
     # ---------------------------------------------------------
     comment = data.get("data") or {}
 
@@ -299,7 +222,7 @@ def webhook():
     comment_id = comment.get("comment_id")
 
     # ---------------------------------------------------------
-    # Match rules
+    # Find matching rules
     # ---------------------------------------------------------
     cur.execute(
         "SELECT rule_id, keyword FROM rules"
@@ -308,10 +231,10 @@ def webhook():
     rules = cur.fetchall()
 
     for r in rules:
-
         rule_id = r[0]
         keyword = r[1]
 
+        # Case-insensitive substring matching.
         if keyword.lower() in text.lower():
 
             ts = now_ts()
@@ -348,7 +271,7 @@ def webhook():
                 db.commit()
 
             except sqlite3.IntegrityError:
-
+                # Duplicate delivery for the same rule + user.
                 cur.execute(
                     """
                     INSERT INTO metrics(key, value)
@@ -367,6 +290,7 @@ def webhook():
 
     db.close()
 
+    # Must respond quickly with HTTP 200.
     return ("", 200)
 
 def send_dm(delivery, rule_message):
